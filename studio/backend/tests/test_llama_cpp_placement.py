@@ -2274,7 +2274,7 @@ def test_the_opt_out_on_a_fitting_unmapped_load_changes_nothing(tmp_path, monkey
     assert not [line for line in logged if "Overriding the unmapped load mode" in line], logged
 
 
-def _apu_backend(tmp_path, *, gguf_gb, avail_mib, monkeypatch):
+def _apu_backend(tmp_path, *, gguf_gb, avail_mib, monkeypatch, memory = None):
     """A ROCm unified-memory APU: the weights load into system RAM, and the APU's
     reported GPU pool IS that RAM.
 
@@ -2283,7 +2283,11 @@ def _apu_backend(tmp_path, *, gguf_gb, avail_mib, monkeypatch):
     an iGPU), so on ROCm the APU's pool is credited against the weights as if it were
     dedicated VRAM, the spill prices out at zero and the guard abstains. The APU
     preflight is the only reading that sees the shortfall."""
-    backend, gguf = _backend(tmp_path, vulkan = False, memory = [(0, 60_000, 60_000)])
+    backend, gguf = _backend(
+        tmp_path,
+        vulkan = False,
+        memory = [(0, 60_000, 60_000)] if memory is None else memory,
+    )
     backend._get_gguf_size_bytes = lambda _path: int(gguf_gb * 1024**3)
     backend._amd_apu_wants_unified_memory = lambda *_a, **_kw: True
     backend._apu_ram_shortfall_message = LlamaCppBackend._apu_ram_shortfall_message
@@ -2328,6 +2332,27 @@ def test_an_unmapped_apu_load_that_fits_is_left_exactly_as_asked(tmp_path, monke
     cmd = _launch(backend, gguf, extra_args = extra_args)["cmd"]
 
     assert _unmapped_tokens(cmd) == list(extra_args), f"the fitting APU load lost it: {cmd}"
+    assert backend.last_load_warning is None
+
+
+def test_windows_uma_pool_prevents_the_issue_6834_false_shortfall(tmp_path, monkeypatch):
+    """A 21.3 GiB GGUF fits the APU's 110 GiB free UMA pool even though BIOS
+    carve-out leaves only 22 GiB CPU-visible. The preflight must reuse the corrected
+    GPU probe instead of remapping a --no-mmap load from psutil's smaller number."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    backend, gguf = _apu_backend(
+        tmp_path,
+        gguf_gb = 21.3,
+        avail_mib = 22 * 1024,
+        monkeypatch = monkeypatch,
+        # _get_gpu_memory already removed its 1 GiB placement reserve.
+        memory = [(0, 109 * 1024, 0)],
+    )
+
+    cmd = _launch(backend, gguf, extra_args = ["--no-mmap"])["cmd"]
+
+    assert cmd, "the APU load never spawned llama-server"
+    assert _unmapped_tokens(cmd) == ["--no-mmap"], cmd
     assert backend.last_load_warning is None
 
 
