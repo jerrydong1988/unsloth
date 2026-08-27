@@ -11,6 +11,7 @@ import types
 
 import pytest
 
+import core.inference.llama_cpp as llama_cpp
 from core.inference.llama_cpp import LlamaCppBackend
 
 _VISIBLE_DEVICE_MASKS = ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")
@@ -176,6 +177,11 @@ def _probe(
         LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: 1 << 30)
     )
     monkeypatch.setattr(
+        LlamaCppBackend,
+        "_rocm_windows_free_memory_mib_by_physical_id",
+        staticmethod(lambda _ids: {}),
+    )
+    monkeypatch.setattr(
         "core.inference.llama_cpp.subprocess.run",
         lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("no nvidia-smi")),
     )
@@ -264,12 +270,13 @@ class TestAmdSdkWheelsCountAsRocm:
         assert LlamaCppBackend._amd_apu_wants_unified_memory([0]) is expected
 
 
-class TestTheApuBudgetIsCappedByHostRam:
+class TestTheApuBudgetUsesTheBestHostBackedPool:
     """Windows HIP without the SDK reports free==total (#7072), so the ROCm free
-    figure cannot be trusted on a shared pool. System RAM is the real ceiling."""
+    figure cannot be trusted on a shared pool. WDDM is authoritative when it can
+    measure the UMA pool; system RAM remains the conservative fallback."""
 
     @staticmethod
-    def _probe(monkeypatch, arch, free_mib, avail_mib):
+    def _probe(monkeypatch, arch, free_mib, avail_mib, windows_free_mib = None):
         t = _fake_torch("6.2.0", [arch])
         t.cuda.mem_get_info = lambda i: (free_mib * 1024 * 1024, free_mib * 1024 * 1024)
         monkeypatch.setitem(sys.modules, "torch", t)
@@ -277,6 +284,13 @@ class TestTheApuBudgetIsCappedByHostRam:
             monkeypatch.delenv(_m, raising = False)
         monkeypatch.setattr(
             LlamaCppBackend, "_available_system_memory_mib", staticmethod(lambda: avail_mib)
+        )
+        monkeypatch.setattr(
+            LlamaCppBackend,
+            "_rocm_windows_free_memory_mib_by_physical_id",
+            staticmethod(
+                lambda _ids: {} if windows_free_mib is None else {0: windows_free_mib}
+            ),
         )
         monkeypatch.setattr(LlamaCppBackend, "_is_vulkan_backend", staticmethod(lambda b: False))
         monkeypatch.setattr(
@@ -291,6 +305,17 @@ class TestTheApuBudgetIsCappedByHostRam:
     def test_the_sentinel_is_capped(self, monkeypatch):
         assert self._probe(monkeypatch, "gfx1151", 100_000, 12_000) == [(0, 12_000 - 1024, 0)]
 
+    def test_wddm_uma_free_wins_over_cpu_visible_ram(self, monkeypatch):
+        """A large BIOS UMA carve-out must not be collapsed to psutil's much
+        smaller CPU-visible MemAvailable figure (issue #6834)."""
+        assert self._probe(
+            monkeypatch,
+            "gfx1151",
+            free_mib = 100_000,
+            avail_mib = 34 * 1024,
+            windows_free_mib = 94 * 1024,
+        ) == [(0, 93 * 1024, 0)]
+
     def test_an_honest_smaller_free_wins(self, monkeypatch):
         """The cap is a ceiling, never a floor."""
         assert self._probe(monkeypatch, "gfx1151", 8_000, 64_000) == [(0, 8_000 - 1024, 0)]
@@ -300,6 +325,56 @@ class TestTheApuBudgetIsCappedByHostRam:
 
     def test_a_discrete_card_is_never_capped(self, monkeypatch):
         assert self._probe(monkeypatch, "gfx1100", 100_000, 12_000) == [(0, 100_000, 100_000)]
+
+
+class TestWindowsRocmUnifiedPoolTelemetry:
+    def test_free_pool_is_total_minus_wddm_usage(self, monkeypatch):
+        monkeypatch.setattr(llama_cpp, "sys", types.SimpleNamespace(platform = "win32"))
+        import utils.hardware.hardware as hardware
+
+        monkeypatch.setattr(
+            hardware,
+            "_rocm_windows_per_device_vram",
+            lambda ids: (
+                [
+                    {
+                        "index": ids[0],
+                        "visible_ordinal": 0,
+                        "name": "Radeon 8060S",
+                        "used_gb": 16.0,
+                        "total_gb": 110.0,
+                    }
+                ],
+                16.0,
+            ),
+        )
+
+        assert LlamaCppBackend._rocm_windows_free_memory_mib_by_physical_id([7]) == {
+            7: 94 * 1024
+        }
+
+    def test_unknown_wddm_usage_falls_back(self, monkeypatch):
+        monkeypatch.setattr(llama_cpp, "sys", types.SimpleNamespace(platform = "win32"))
+        import utils.hardware.hardware as hardware
+
+        monkeypatch.setattr(
+            hardware,
+            "_rocm_windows_per_device_vram",
+            lambda ids: (
+                [
+                    {
+                        "index": ids[0],
+                        "visible_ordinal": 0,
+                        "name": "Radeon 8060S",
+                        "used_gb": None,
+                        "total_gb": 110.0,
+                    }
+                ],
+                None,
+            ),
+        )
+
+        assert LlamaCppBackend._rocm_windows_free_memory_mib_by_physical_id([0]) == {}
 
 
 class TestRadeonWheelsWithoutAnArchName:
