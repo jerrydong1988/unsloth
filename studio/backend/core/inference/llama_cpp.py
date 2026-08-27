@@ -12387,6 +12387,49 @@ class LlamaCppBackend:
         return totals
 
     @staticmethod
+    def _rocm_windows_free_memory_mib_by_physical_id(
+        physical_ids: Iterable[int],
+    ) -> dict[int, int]:
+        """Trusted free unified-memory pool per physical ROCm GPU on Windows.
+
+        Windows HIP can report ``free == total`` for an APU even while other
+        processes occupy the shared pool (#7072). The System telemetry path
+        already reconciles torch's allocatable total with WDDM Dedicated and
+        Shared Usage counters, including its conservative multi-device identity
+        checks. Reuse that result instead of treating ``psutil``'s CPU-visible
+        ``MemAvailable`` as the size of a BIOS-carved UMA pool.
+
+        Missing or unattributable usage is omitted so callers can fall back to
+        the existing system-RAM ceiling. This helper never invents a larger free
+        figure than the WDDM-backed total it was given.
+        """
+        if sys.platform != "win32":
+            return {}
+        try:
+            device_ids = [int(idx) for idx in physical_ids]
+            if not device_ids:
+                return {}
+            from utils.hardware.hardware import _rocm_windows_per_device_vram
+
+            devices, _aggregate_gb = _rocm_windows_per_device_vram(device_ids)
+            free_by_id: dict[int, int] = {}
+            for device in devices:
+                idx = int(device["index"])
+                used_gb = device.get("used_gb")
+                total_gb = device.get("total_gb")
+                if used_gb is None or total_gb is None:
+                    continue
+                used = float(used_gb)
+                total = float(total_gb)
+                if not (math.isfinite(used) and math.isfinite(total)) or total <= 0 or used < 0:
+                    continue
+                free_by_id[idx] = math.floor(max(0.0, total - used) * 1024)
+            return free_by_id
+        except Exception as e:
+            logger.debug(f"Windows ROCm unified-memory probe failed: {e}")
+            return {}
+
+    @staticmethod
     def _amd_smi_hip_id_map(
         enumerated: list[int], mask: Optional[list[int]]
     ) -> Optional[dict[int, int]]:
@@ -12887,6 +12930,22 @@ class LlamaCppBackend:
             # An integrated CUDA SoC shares one pool too, and its free reading is wrong
             # in the OPPOSITE direction to ROCm's -- see below.
             integrated_ids = LlamaCppBackend._integrated_cuda_gpu_ids()
+            device_count = torch.cuda.device_count()
+            visible_physical_ids = [
+                (
+                    physical_ids[ordinal]
+                    if physical_ids is not None and ordinal < len(physical_ids)
+                    else ordinal
+                )
+                for ordinal in range(device_count)
+            ]
+            windows_free_by_id = (
+                LlamaCppBackend._rocm_windows_free_memory_mib_by_physical_id(
+                    visible_physical_ids
+                )
+                if unified_ids
+                else {}
+            )
             # Same #7624 arch gate the amd-smi branch applies, from the one helper.
             arch_keeps = LlamaCppBackend._rocm_arch_gate_keep(binary, torch, for_llama_server)
             # How many devices the shared pool is about to be divided between. Read
@@ -12900,7 +12959,7 @@ class LlamaCppBackend:
             # holds in the backend process stops being offered to llama.cpp slots.
             from utils.hardware import trusted_mem_get_info
 
-            for ordinal in range(torch.cuda.device_count()):
+            for ordinal in range(device_count):
                 free_bytes, total_bytes = trusted_mem_get_info(ordinal)
                 idx = (
                     physical_ids[ordinal]
@@ -12916,9 +12975,13 @@ class LlamaCppBackend:
                 total_mib = total_bytes // (1024 * 1024)
                 if shared:
                     # ROCm's free is unreliable on a shared pool (Windows HIP
-                    # reports free==total, #7072), and system RAM is the real
-                    # ceiling there, so cap before taking the reserve.
-                    avail = LlamaCppBackend._available_system_memory_mib()
+                    # reports free==total, #7072). Native Windows first uses the
+                    # WDDM-backed UMA pool, which remains visible even when BIOS
+                    # carve-out leaves little CPU-addressable RAM. Other hosts and
+                    # uncertain Windows readings retain the system-RAM fallback.
+                    avail = windows_free_by_id.get(idx)
+                    if avail is None:
+                        avail = LlamaCppBackend._available_system_memory_mib()
                     if avail is not None:
                         raw_mib = min(raw_mib, avail)
                 elif integrated:
@@ -25846,6 +25909,32 @@ class LlamaCppBackend:
                     # second live reading there would be the pool MINUS the model the
                     # reprice is asking about, which double-charges it.
                     _apu_avail_mib = self._available_system_memory_mib()
+                    if sys.platform == "win32":
+                        # _get_gpu_memory has already replaced Windows HIP's
+                        # free==total sentinel with either the trusted WDDM UMA
+                        # reading or the system-RAM fallback, then removed the
+                        # 1 GiB placement reserve. Reuse that same launch-time
+                        # sample here instead of calling psutil again and treating
+                        # CPU-visible RAM as the limit of a BIOS-carved GPU pool.
+                        selected_ids = (
+                            None
+                            if gpu_indices is None
+                            else {int(idx) for idx in gpu_indices}
+                        )
+                        shared_pool_avail = [
+                            (
+                                free_mib + _IGPU_HOST_RESERVE_MIB
+                                if free_mib > 0
+                                else 0
+                            )
+                            for idx, free_mib in _detected_gpus
+                            if total_by_idx.get(idx, 1) <= 0
+                            and (selected_ids is None or idx in selected_ids)
+                        ]
+                        if shared_pool_avail:
+                            # Several APUs may describe one host-backed pool; do
+                            # not add the readings together.
+                            _apu_avail_mib = max(shared_pool_avail)
                     # Kept beside the notice: the text-only fallback rebuilds it later
                     # and would otherwise turn a Spark's into an APU's, .wslconfig hint
                     # and all.
