@@ -1939,8 +1939,8 @@ class TestUnifiedMemoryOptOut:
     only route was patching the source. The host below is the reported one: a
     gfx1151 Strix Halo APU whose pool ROCm reports in full. Mock-based, no ROCm."""
 
-    def _strix_halo(self, monkeypatch):
-        _apply_os(monkeypatch, "linux", is_rocm = True)
+    def _strix_halo(self, monkeypatch, os_key = "linux"):
+        _apply_os(monkeypatch, os_key, is_rocm = True)
         monkeypatch.setattr(
             LlamaCppBackend, "_rocm_unified_memory_gpu_ids", staticmethod(lambda: {0})
         )
@@ -1957,11 +1957,12 @@ class TestUnifiedMemoryOptOut:
         tmp_path,
         monkeypatch,
         env_extra = None,
+        os_key = "linux",
     ):
         return _run_auto_load(
             monkeypatch,
             tmp_path,
-            self._strix_halo(monkeypatch),
+            self._strix_halo(monkeypatch, os_key),
             None,
             returncode = None,
             env_extra = env_extra,
@@ -1970,6 +1971,24 @@ class TestUnifiedMemoryOptOut:
     def test_the_apu_still_gets_it_by_default(self, tmp_path, monkeypatch, probe_env):
         """Baseline: #5301 added the variable for exactly this hardware."""
         _cmd, env = self._load(tmp_path, monkeypatch)[0]
+        assert env.get("GGML_CUDA_ENABLE_UNIFIED_MEMORY") == "1"
+
+    def test_windows_apu_prefers_device_local_memory_by_default(
+        self, tmp_path, monkeypatch, probe_env
+    ):
+        """WDDM owns residency; managed allocations charge Shared GPU Memory."""
+        _cmd, env = self._load(tmp_path, monkeypatch, os_key = "windows")[0]
+        assert "GGML_CUDA_ENABLE_UNIFIED_MEMORY" not in env
+
+    def test_windows_apu_still_honors_an_explicit_managed_memory_opt_in(
+        self, tmp_path, monkeypatch, probe_env
+    ):
+        _cmd, env = self._load(
+            tmp_path,
+            monkeypatch,
+            {"GGML_CUDA_ENABLE_UNIFIED_MEMORY": "1"},
+            os_key = "windows",
+        )[0]
         assert env.get("GGML_CUDA_ENABLE_UNIFIED_MEMORY") == "1"
 
     @pytest.mark.parametrize("value", ["0", "", "false", "FALSE", "no", "off", " 0 "])
