@@ -458,7 +458,26 @@ class TestTheOptOutHelper:
             ),
         ],
     )
-    def test_opt_out_decisions(self, env, expected):
+    def test_opt_out_decisions(self, monkeypatch, env, expected):
+        # Preserve the pre-existing non-Windows contract independently of the
+        # platform running pytest.
+        monkeypatch.setattr(llama_cpp.sys, "platform", "linux")
+        assert LlamaCppBackend._unified_memory_opted_out(env) is expected
+
+    @pytest.mark.parametrize(
+        "env,expected",
+        [
+            ({}, True),
+            ({"UNSLOTH_DISABLE_UNIFIED_MEMORY": "0"}, True),
+            ({"GGML_CUDA_ENABLE_UNIFIED_MEMORY": "0"}, True),
+            ({"GGML_CUDA_ENABLE_UNIFIED_MEMORY": "1"}, False),
+            ({"GGML_CUDA_ENABLE_UNIFIED_MEMORY": "true"}, False),
+        ],
+    )
+    def test_windows_prefers_device_local_memory_unless_explicitly_enabled(
+        self, monkeypatch, env, expected
+    ):
+        monkeypatch.setattr(llama_cpp.sys, "platform", "win32")
         assert LlamaCppBackend._unified_memory_opted_out(env) is expected
 
     def test_none_reads_the_process_env(self, monkeypatch):

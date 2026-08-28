@@ -7762,6 +7762,12 @@ class LlamaCppBackend:
         ggml tests presence, not value, so `=0` is not an off switch (#8651). Both
         opt-outs (UNSLOTH_DISABLE_UNIFIED_MEMORY=1, mirroring UNSLOTH_DISABLE_DC_TUNING,
         or a falsy GGML_CUDA_ENABLE_UNIFIED_MEMORY) must end in the name unset.
+
+        Native Windows defaults to device-local allocations when the variable is
+        absent. WDDM already manages residency for an APU's BIOS-carved dedicated
+        segment; forcing hipMallocManaged instead charges the allocation to Shared
+        GPU Memory / CPU-visible RAM and can fail during startup on gfx1151. A
+        truthy GGML_CUDA_ENABLE_UNIFIED_MEMORY remains an explicit opt-in.
         Fails open (False) so a bad env never blocks a load.
         """
         try:
@@ -7770,7 +7776,7 @@ class LlamaCppBackend:
                 return True
             value = source.get("GGML_CUDA_ENABLE_UNIFIED_MEMORY")
             if value is None:
-                return False
+                return sys.platform == "win32"
             return str(value).strip().lower() in LlamaCppBackend._UNIFIED_MEMORY_OFF
         except Exception:
             return False
